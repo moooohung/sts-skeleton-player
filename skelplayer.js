@@ -1,6 +1,6 @@
 "use strict";
 /* First-party skeletal player. Written from public file-format documents,
- * exported game data, and general mathematics. See cleanroom_log.md.
+ * exported game data, and general mathematics. See reports/packet129/cleanroom_log.md.
  * No Spine runtime implementation was read or incorporated. */
 const SkelPlayer = (() => {
   class FormatError extends Error {
@@ -189,7 +189,9 @@ const SkelPlayer = (() => {
     return { skeleton,bones,slots,ik,reader:r,nonessential };
   }
   function readSequence(r) {
-    return {count:r.count("sequence images"),start:r.varint(),digits:r.varint(),setupIndex:r.varint()};
+    const sequence={count:r.count("sequence images"),start:r.varint(),digits:r.varint(),setupIndex:r.varint()};
+    if(!sequence.count||sequence.setupIndex>=sequence.count)throw new FormatError('Invalid sequence image count or setup index',r.pos);
+    return sequence;
   }
   function readVertices(r, weighted, boneCount) {
     const count=r.count("vertices"), vertices=[], weights=weighted ? [] : null;
@@ -571,11 +573,22 @@ const SkelPlayer = (() => {
       this.constraints={};
       for(const kind of ["ik","transform","path","physics"])this.constraints[kind]=data[kind].map(c=>({...c,data:c}));
       this.setToSetupPose();
+      this.updateCache();
     }
+    updateCache() {this.constraintOrder=Object.entries(this.constraints).flatMap(([kind,list])=>list.map((c,index)=>({kind,c,index}))).sort((a,b)=>a.c.order-b.c.order);this.updateActive();}
     setSkin(name) {
       const skin=this.data.skins.find(s=>s.name===name);
       if(!skin)throw new FormatError(`Unknown skin: ${name}`);
-      this.skin=skin;this.setSlotsToSetupPose();
+      if(skin===this.skin)return;
+      const previous=this.skin;
+      this.skin=skin;
+      this.updateCache();
+      // Changing a skin replaces attachments supplied by the preceding skin.
+      // It does not reset colors, draw order, or a manually selected attachment.
+      for(const [index,slot] of this.slots.entries()){
+        const key=Object.entries(previous?.attachments[index]||{}).find(([,a])=>a===slot.attachment)?.[0];
+        if(key&&skin.attachments[index]?.[key])this.setAttachment(index,key);
+      }
     }
     bindAtlas(atlas) {
       this.atlas=atlas;
@@ -589,7 +602,7 @@ const SkelPlayer = (() => {
         });
       }
     }
-    attachment(slot,name) {return name===null ? null : this.skin?.attachments[slot]?.[name] || this.data.skins[0]?.attachments[slot]?.[name] || null;}
+    attachment(slot,name) {return name===null ? null : this.skin?.attachments[slot]?.[name] || this.data.skins.find(s=>s.name==='default')?.attachments[slot]?.[name] || null;}
     setAttachment(slot,name) {
       const s=this.slots[slot],attachment=this.attachment(slot,name);s.attachmentName=name;
       if(s.attachment===attachment)return;
@@ -604,15 +617,16 @@ const SkelPlayer = (() => {
       for(const kind of Object.keys(this.constraints))this.constraints[kind].forEach(c=>Object.assign(c,c.data));
       this.setSlotsToSetupPose();
     }
-    applyAnimation(name,time,{loop=false,alpha:baseAlpha=1,lastTime=-1,timelineAlpha=null,discreteAlpha=null,rotationDifference=null,rotationBase=null,timelineSetup=null,mixOut=false}={}) {
-      const animation=this.data.animations.find(a=>a.name===name);
+    applyAnimation(name,time,{loop=false,alpha:baseAlpha=1,lastTime=-1,timelineAlpha=null,discreteAlpha=null,rotationDifference=null,rotationBase=null,timelineSetup=null,mixOut=false,beforeFirst='setup',mixBlend=null,discreteAllowed=null,resetTimelines=true}={}) {
+      const animation=typeof name==='object'?name:this.data.animations.find(a=>a.name===name);
       if(!animation)throw new FormatError(`Unknown animation: ${name}`);
+      if(mixBlend!==null&&!['setup','first','replace','add'].includes(mixBlend))throw new FormatError(`Unknown mix blend: ${mixBlend}`);
       const absoluteTime=time;
       if(loop && animation.duration>0){time%=animation.duration;if(time<0)time+=animation.duration;}
       const events=[];
       this.updateActive();
       for(const t of animation.timelines) {
-        const alpha=timelineAlpha ? timelineAlpha(t) : baseAlpha,discrete=discreteAlpha===null ? alpha : discreteAlpha;
+        const alpha=timelineAlpha ? timelineAlpha(t) : baseAlpha,discrete=typeof discreteAlpha==='function'?discreteAlpha(t):discreteAlpha===null ? alpha : discreteAlpha;
         if(t.type==="event") {
           if(loop && animation.duration>0) {
             const from=Math.floor(Math.max(0,lastTime)/animation.duration),to=Math.floor(absoluteTime/animation.duration);
@@ -620,21 +634,30 @@ const SkelPlayer = (() => {
           } else for(const f of t.frames)if(f.time>lastTime && f.time<=time)events.push({...f});
           continue;
         }
+        if(t.type==='physicsReset') {
+          const crossed=t.frames.some(f=>loop&&animation.duration>0
+            ? Math.floor((absoluteTime-f.time)/animation.duration)>Math.floor((lastTime-f.time)/animation.duration)
+            : f.time>lastTime&&f.time<=time);
+          if(crossed&&resetTimelines)for(const [i,c] of this.constraints.physics.entries())if(t.physics===i||t.physics===-1)c.resetPending=true;
+          continue;
+        }
         if(t.bone!==undefined && !this.bones[t.bone].active || t.slot!==undefined && !this.bones[this.slots[t.slot].data.bone].active)continue;
+        if(discreteAllowed&&!discreteAllowed(t))continue;
         if(t.type==='sequence'&&mixOut) {
           const slot=this.slots[t.slot];if(slot.attachment===t.attachment&&timelineSetup?.(t))slot.sequenceIndex=-1;
           continue;
         }
-        if(timelineSetup?.(t)) {
+        if(mixBlend==='setup'||timelineSetup?.(t)) {
+          const restore=property=>mixBlend==='setup'||timelineSetup?.(t,property);
           if(t.bone!==undefined) {
-            const b=this.bones[t.bone];for(const property of timelineProperties(t)){const key=property.split('/').at(-1);b[key]=b.data[key];}
+            const b=this.bones[t.bone];for(const property of timelineProperties(t))if(restore(property)){const key=property.split('/').at(-1);b[key]=b.data[key];}
           } else if(t.slot!==undefined) {
             const slot=this.slots[t.slot],light=unpackColor(slot.data.color),dark=slot.data.dark?unpackColor(slot.data.dark):null;
             if(t.type==='sequence'&&slot.attachment===t.attachment)slot.sequenceIndex=-1;
             else if(t.type==='deform'&&slot.attachment&&(slot.attachment.deformSource||slot.attachment)===t.attachment)slot.deform=[];
             else if(['rgba','rgb','rgba2','rgb2','alpha'].includes(t.type)) {
-              const keys=t.type==='alpha'?[3]:t.type.startsWith('rgba')?[0,1,2,3]:[0,1,2];keys.forEach(k=>slot.color[k]=light[k]);
-              if(t.type.endsWith('2')&&dark)slot.darkColor=dark;
+              const keys=t.type==='alpha'?[3]:t.type.startsWith('rgba')?[0,1,2,3]:[0,1,2];keys.forEach(k=>{if(restore(`slot/${t.slot}/${['r','g','b','a'][k]}`))slot.color[k]=light[k];});
+              if(t.type.endsWith('2')&&dark&&restore(`slot/${t.slot}/dark`))slot.darkColor=dark;
             }
           } else if(t.ik!==undefined) {
             const c=this.constraints.ik[t.ik];for(const k of ['mix','softness','bendDirection','compress','stretch'])c[k]=c.data[k];
@@ -645,13 +668,16 @@ const SkelPlayer = (() => {
           } else if(t.physics!==undefined) {
             const key={physicsInertia:'inertia',physicsStrength:'strength',physicsDamping:'damping',physicsMass:'massInverse',physicsWind:'wind',physicsGravity:'gravity',physicsMix:'mix'}[t.type];
             if(key)for(const [i,c] of this.constraints.physics.entries())if(t.physics===i||t.physics===-1&&c.data[(key==='massInverse'?'mass':key)+'Global'])c[key]=c.data[key];
-          }
+          } else if(t.type==='drawOrder')this.drawOrder=this.slots.map((_,i)=>i);
         }
         let frame=timelineValue(t,time,this.curveSegments);
         if(!frame) {
+          if(mixBlend==='replace'||mixBlend==='add')continue;
+          if((typeof beforeFirst==='function'?beforeFirst(t):beforeFirst)==='replace')continue;
           if(t.bone!==undefined) {
             const defaults={rotate:[0],translate:[0,0],translateX:[0],translateY:[0],scale:[1,1],scaleX:[1],scaleY:[1],shear:[0,0],shearX:[0],shearY:[0]};
             if(defaults[t.type])frame={values:defaults[t.type],beforeFirst:true};
+            else if(t.type==='inherit'){if(mixBlend!=='add')this.bones[t.bone].transform=this.bones[t.bone].data.transform;}
           } else if(['rgba','rgb','rgba2','rgb2','alpha'].includes(t.type)) {
             const slot=this.slots[t.slot],light=unpackColor(slot.data.color),dark=slot.data.dark?unpackColor(slot.data.dark):[0,0,0,0];
             frame={values:t.type==='alpha'?[light[3]]:t.type==='rgba'?light:t.type==='rgb'?light.slice(0,3):t.type==='rgba2'?[...light,...dark.slice(0,3)]:[...light.slice(0,3),...dark.slice(0,3)]};
@@ -670,9 +696,10 @@ const SkelPlayer = (() => {
               else if(slot.deform.length)slot.deform=slot.deform.map((v,i)=>v+((a.weights?0:a.vertices[i])-v)*alpha);
             }
           } else if(t.type==='attachment'&&!mixOut&&discrete>=.5)this.setAttachment(t.slot,this.slots[t.slot].data.attachment);
+          else if(t.type==='drawOrder'&&!mixOut&&discrete>=.5)this.drawOrder=this.slots.map((_,i)=>i);
           if(!frame)continue;
         }
-        const blend=(obj,key,value)=>{obj[key]=alpha===1?value:obj[key]+(value-obj[key])*alpha;};
+        const blend=(obj,key,value)=>{const setup=obj.data?.[key]??0;obj[key]=mixBlend==='add'?obj[key]+(value-setup)*alpha:alpha===1?value:obj[key]+(value-obj[key])*alpha;};
         const values=frame.values;
         if(t.bone!==undefined) {
           const b=this.bones[t.bone],d=b.data;
@@ -681,7 +708,8 @@ const SkelPlayer = (() => {
             const fields={rotate:["rotation"],translate:["x","y"],translateX:["x"],translateY:["y"],scale:["scaleX","scaleY"],scaleX:["scaleX"],scaleY:["scaleY"],shear:["shearX","shearY"],shearX:["shearX"],shearY:["shearY"]}[t.type];
             fields.forEach((key,i)=>{
               const value=t.type.startsWith("scale") ? d[key]*values[i] : d[key]+values[i];
-              if(t.type.startsWith("scale") && alpha!==1&&!frame.beforeFirst) {
+              if(mixBlend==='add')b[key]+=(value-d[key])*alpha;
+              else if(t.type.startsWith("scale") && alpha!==1&&!frame.beforeFirst) {
                 const sign=(mixOut ? b[key] : value)<0 ? -1 : 1;
                 b[key]=sign*(Math.abs(b[key])+(Math.abs(value)-Math.abs(b[key]))*alpha);
               } else if(key==="rotation" && alpha!==1) {
@@ -696,13 +724,14 @@ const SkelPlayer = (() => {
         } else if(["rgba","rgb","rgba2","rgb2","alpha"].includes(t.type)) {
           const slot=this.slots[t.slot];
           const light=t.type==="alpha" ? [3] : t.type.startsWith("rgba") ? [0,1,2,3] : [0,1,2];
-          light.forEach((key,i)=>{const value=slot.color[key]+(values[i]-slot.color[key])*alpha;slot.color[key]=["alpha","rgb","rgb2"].includes(t.type) ? value : Math.max(0,Math.min(1,value));});
-          if(t.type.endsWith("2") && slot.darkColor)for(let i=0;i<3;i++)slot.darkColor[i]=Math.max(0,Math.min(1,slot.darkColor[i]+(values[light.length+i]-slot.darkColor[i])*alpha));
+          const setup=unpackColor(slot.data.color);
+          light.forEach((key,i)=>{const value=slot.color[key]+(values[i]-(mixBlend==='add'?setup[key]:slot.color[key]))*alpha;slot.color[key]=["alpha","rgb","rgb2"].includes(t.type) ? value : Math.max(0,Math.min(1,value));});
+          if(t.type.endsWith("2") && slot.darkColor){const dark=unpackColor(slot.data.dark);for(let i=0;i<3;i++)slot.darkColor[i]=Math.max(0,Math.min(1,slot.darkColor[i]+(values[light.length+i]-(mixBlend==='add'?dark[i]:slot.darkColor[i]))*alpha));}
         } else if(t.type==="deform") {
           const slot=this.slots[t.slot],a=slot.attachment;
           if(a && (a.deformSource || a)===t.attachment) {
             if(!slot.deform.length)slot.deform=a.weights ? Array(values.length).fill(0) : a.vertices.slice();
-            values.forEach((v,i)=>{slot.deform[i]+=(v-slot.deform[i])*alpha;});
+            values.forEach((v,i)=>{slot.deform[i]+=(v-(mixBlend==='add'?(a.weights?0:a.vertices[i]):slot.deform[i]))*alpha;});
           }
         } else if(t.type==="drawOrder") {
           if(discrete>=0.5)this.drawOrder=frame.order.slice();
@@ -710,6 +739,7 @@ const SkelPlayer = (() => {
           const slot=this.slots[t.slot],sequence=t.attachment.sequence;
           if(slot.attachment!==t.attachment || !sequence || discrete<0.5)continue;
           const mode=frame.modeAndIndex&15,index=frame.modeAndIndex>>4,steps=frame.delay>0 ? Math.floor((time-frame.time)/frame.delay+0.00001) : 0,n=sequence.count;
+          if(mode>6||!Number.isFinite(frame.delay)||frame.delay<0||n<1)throw new FormatError('Invalid sequence mode, delay or image count');
           let v=index;
           if(mode===1)v=Math.min(n-1,index+steps);
           else if(mode===2)v=(index+steps)%n;
@@ -731,7 +761,7 @@ const SkelPlayer = (() => {
           if(key)for(const [i,c] of this.constraints.physics.entries())if(t.physics===i || t.physics===-1 && c.data[(key==="massInverse" ? "mass" : key)+"Global"]) {
             if(key==='massInverse') {
               const mass=frame.beforeFirst?1/c.data.massInverse:values[0],previous=1/c.massInverse;
-              c.massInverse=1/(alpha===1?mass:previous+(mass-previous)*alpha);
+              c.massInverse=1/(mixBlend==='add'?previous+(mass-1/c.data.massInverse)*alpha:alpha===1?mass:previous+(mass-previous)*alpha);
             } else blend(c,key,frame.beforeFirst?c.data[key]:values[0]);
           }
         }
@@ -743,9 +773,8 @@ const SkelPlayer = (() => {
       for(const b of this.bones){b.applied=localPose(b);b.matrixOverride=null;}
       this.updateBones();
       if(constraints) {
-        const ordered=Object.entries(this.constraints).flatMap(([kind,list])=>list.map(c=>({kind,c}))).sort((a,b)=>a.c.order-b.c.order);
-        for(const {kind,c} of ordered) {
-          if(c.skinRequired && !this.skin?.[kind]?.includes(this.constraints[kind].indexOf(c)))continue;
+        for(const {kind,c,index} of this.constraintOrder) {
+          if(c.skinRequired && !this.skin?.[kind]?.includes(index))continue;
           if(kind==="ik")this.applyIK(c);
           else if(kind==="transform")this.applyTransform(c);
           else if(kind==="path")this.applyPath(c);
@@ -1020,7 +1049,11 @@ const SkelPlayer = (() => {
     }
     update(delta) {this.time+=delta;}
     applyPhysics(c,mode) {
+      if(!['none','reset','update','pose'].includes(mode))throw new FormatError(`Unknown physics mode: ${mode}`);
+      if(mode==='none')return;
       const bone=this.bones[c.bone];if(!bone.active || !c.mix)return;
+      if(c.resetPending){mode='reset';c.resetPending=false;}
+      if(mode==='pose'&&!c.simulation)return;
       const b={...bone.matrix},length=Math.hypot(b.a,b.b),angle=Math.atan2(b.b,b.a);
       if(mode==="reset" || !c.simulation) {
         c.simulation={time:this.time,remaining:mode==="reset" ? 0 : this.time,baseX:b.x,baseY:b.y,originX:b.x,originY:b.y,angle,physicalAngle:angle,length,x:0,y:0,rotate:0,scale:0,vx:0,vy:0,vr:0,vs:0};
@@ -1110,7 +1143,13 @@ const SkelPlayer = (() => {
     if(r.rotate===270)return [(r.x+r.height-y)/w,(r.y+x)/h];
     return [(r.x+x)/w,(r.y+y)/h];
   }
+  const timelinePropertyCache=new WeakMap();
   function timelineProperties(t) {
+    let value=timelinePropertyCache.get(t);
+    if(!value){value=timelinePropertiesUncached(t);timelinePropertyCache.set(t,value);}
+    return value;
+  }
+  function timelinePropertiesUncached(t) {
     if(t.bone!==undefined)return ({rotate:['rotation'],translate:['x','y'],translateX:['x'],translateY:['y'],scale:['scaleX','scaleY'],scaleX:['scaleX'],scaleY:['scaleY'],shear:['shearX','shearY'],shearX:['shearX'],shearY:['shearY'],inherit:['transform']}[t.type]||[]).map(k=>`bone/${t.bone}/${k}`);
     if(t.slot!==undefined)return ({attachment:['attachment'],rgba:['r','g','b','a'],rgb:['r','g','b'],alpha:['a'],rgba2:['r','g','b','a','dark'],rgb2:['r','g','b','dark'],deform:['deform/'+t.key],sequence:['sequence/'+t.key]}[t.type]||[]).map(k=>`slot/${t.slot}/${k}`);
     if(t.type==='drawOrder')return ['drawOrder'];
@@ -1119,77 +1158,136 @@ const SkelPlayer = (() => {
     return [`${kind}/${t[kind]}/${t.type}`];
   }
   class AnimationState {
-    constructor(skeleton,{defaultMix=.25}={}) {this.skeleton=skeleton;this.defaultMix=defaultMix;this.timeScale=1;this.current=null;this.listeners=[];}
+    constructor(skeleton,{defaultMix=.25,mixes=[]}={}) {this.skeleton=skeleton;this.defaultMix=defaultMix;this.mixes=mixes;this.timeScale=1;this.current=null;this.listeners=[];this.properties=new WeakMap();this.attachments=new WeakMap();this.triggers=new WeakMap();this.layers=new Map();this.notifications={queue:[],draining:false,depth:0};}
+    mix(from,to) {return this.mixes.find(m=>m.from===from&&m.to===to)?.duration??this.defaultMix;}
     entry(name,loop) {
-      const animation=this.skeleton.data.animations.find(a=>a.name===name);if(!animation)throw new FormatError(`Unknown animation: ${name}`);
-      return {animation,loop,trackTime:0,timeScale:1,lastTime:-1,next:null,delay:0,mixingFrom:null,mixDuration:this.defaultMix,mixTime:0,interruptAlpha:1,rotationAnchors:null,rotationWinding:new Map()};
+      const animation=typeof name==='object'?name:this.skeleton.data.animations.find(a=>a.name===name);if(!animation)throw new FormatError(`Unknown animation: ${name}`);
+      return {animation,loop,trackIndex:this.index||0,trackTime:0,timeScale:1,lastTime:-1,animationLast:-1,animationStart:0,animationEnd:animation.duration,trackEnd:Infinity,
+        alpha:1,holdPrevious:false,mixBlend:'replace',reverse:false,shortestRotation:false,eventThreshold:0,mixAttachmentThreshold:0,mixDrawOrderThreshold:0,alphaAttachmentThreshold:0,listener:null,
+        next:null,previous:null,delay:0,mixingFrom:null,mixingTo:null,mixDuration:this.defaultMix,mixTime:0,interruptAlpha:1,rotationAnchors:null,rotationWinding:new Map(),
+        get animationTime(){const duration=this.animationEnd-this.animationStart;return this.animationStart+(this.loop&&duration>0?this.trackTime%duration:!this.loop&&this.animationEnd>=this.animation.duration?this.trackTime:Math.min(this.trackTime,duration));},
+        get trackComplete(){const duration=this.animationEnd-this.animationStart;return this.loop&&duration>0?duration*(Math.floor(this.trackTime/duration)+1):Math.max(duration,this.trackTime);},
+        resetRotationDirections(){this.rotationWinding.clear();},isComplete(){return this.trackTime>=this.animationEnd-this.animationStart;},isEmptyAnimation(){return this.animation.empty===true;},
+        wasApplied(){return this.lastTime!==-1;},isNextReady(){return !!this.next&&this.lastTime>=this.next.delay;},
+        setMixDuration(duration,delay){this.mixDuration=duration;this.delay=delay>0?delay:this.previous?this.previous.trackComplete-duration+delay:Math.max(0,delay);}};
     }
-    track(index) {if(index!==0)throw new FormatError('Only replay track zero is supported');}
+    notify(type,entry,event) {this.notifications.queue.push({type,entry,event});}
+    drain() {
+      const n=this.notifications;if(n.depth||n.draining)return;n.draining=true;
+      try{while(n.queue.length){const {type,entry,event}=n.queue.shift();entry.listener?.[type]?.(entry,event);for(const listener of this.listeners.slice())listener[type]?.(entry,event);}}finally{n.draining=false;}
+    }
+    retire(entry) {if(!entry||entry.disposed)return;this.retire(entry.mixingFrom);entry.mixingFrom=null;entry.mixingTo=null;if(entry.started)this.notify('end',entry);entry.disposed=true;this.notify('dispose',entry);this.clearNext(entry);}
+    clearNext(entry) {let next=entry.next;entry.next=null;while(next){const after=next.next;next.next=null;this.retire(next);next=after;}this.drain();}
+    track(index) {
+      if(!Number.isInteger(index)||index<0)throw new FormatError('Invalid animation track index');
+      if(index===0)return this;
+      if(!this.layers.has(index)){const layer=new AnimationState(this.skeleton,{defaultMix:this.defaultMix,mixes:this.mixes});layer.index=index;layer.listeners=this.listeners;layer.notifications=this.notifications;this.layers.set(index,layer);}
+      return this.layers.get(index);
+    }
     setAnimation(index,name,loop=false) {
-      this.track(index);const entry=this.entry(name,loop);entry.mixingFrom=this.current;
-      if(entry.mixingFrom?.mixingFrom)entry.mixingFrom.interruptAlpha*=entry.mixingFrom.mixDuration>0 ? Math.min(1,entry.mixingFrom.mixTime/entry.mixingFrom.mixDuration) : 1;
+      const track=this.track(index);if(track!==this){const entry=track.setAnimation(0,name,loop);entry.trackIndex=index;return entry;}
+      const entry=this.entry(name,loop);entry.mixingFrom=this.current;
+      this.notifications.depth++;
+      if(this.current){this.notify('interrupt',this.current);this.clearNext(this.current);}
+      // An entry replaced before it was ever applied contributes no pose.
+      if(entry.mixingFrom?.lastTime===-1){const skipped=entry.mixingFrom;entry.mixingFrom=skipped.mixingFrom;skipped.mixingFrom=null;this.retire(skipped);}
+      if(entry.mixingFrom){entry.mixDuration=this.mix(entry.mixingFrom.animation.name,entry.animation.name);entry.mixingFrom.mixingTo=entry;}
+      if(entry.mixingFrom?.mixingFrom)entry.interruptAlpha=entry.mixingFrom.mixDuration>0 ? Math.min(1,entry.mixingFrom.mixTime/entry.mixingFrom.mixDuration) : 1;
       entry.mixingFrom?.rotationWinding.clear();
-      if(!entry.mixingFrom)entry.mixDuration=0;this.current=entry;return entry;
+      if(!entry.mixingFrom)entry.mixDuration=0;this.current=entry;entry.started=true;this.notify('start',entry);this.notifications.depth--;this.drain();return entry;
     }
     addAnimation(index,name,loop=false,delay=0) {
-      this.track(index);const entry=this.entry(name,loop);let tail=this.current;
-      if(!tail){this.current=entry;entry.mixDuration=0;entry.delay=Math.max(0,delay);return entry;}
+      const track=this.track(index);if(track!==this){const entry=track.addAnimation(0,name,loop,delay);entry.trackIndex=index;return entry;}
+      const entry=this.entry(name,loop);let tail=this.current;
+      if(!tail){this.current=entry;entry.mixDuration=0;entry.delay=Math.max(0,delay);entry.started=true;this.notify('start',entry);this.drain();return entry;}
       while(tail.next)tail=tail.next;
+      entry.mixDuration=this.mix(tail.animation.name,entry.animation.name);
       if(delay<=0) {
-        const duration=tail.animation.duration,end=tail.loop&&duration>0 ? duration*(Math.floor(tail.trackTime/duration)+1) : duration;
-        delay+=Math.max(0,end-entry.mixDuration);
+        delay+=tail.trackComplete-entry.mixDuration;
       }
-      entry.delay=delay;tail.next=entry;return entry;
+      entry.delay=delay;entry.previous=tail;tail.next=entry;return entry;
     }
-    getCurrent(index=0) {this.track(index);return this.current;}
-    clearTracks() {this.current=null;}
+    setEmptyAnimation(index,mixDuration=0) {const entry=this.setAnimation(index,{name:'<empty>',duration:0,timelines:[],empty:true});entry.mixDuration=mixDuration;entry.trackEnd=mixDuration;return entry;}
+    addEmptyAnimation(index,mixDuration=0,delay=0) {const entry=this.addAnimation(index,{name:'<empty>',duration:0,timelines:[],empty:true},false,delay);entry.setMixDuration(mixDuration,delay);entry.trackEnd=mixDuration;return entry;}
+    setEmptyAnimations(mixDuration=0) {if(this.current)this.setEmptyAnimation(0,mixDuration);for(const [index,layer] of this.layers)if(layer.current)this.setEmptyAnimation(index,mixDuration);}
+    getCurrent(index=0) {return index===0?this.current:this.layers.get(index)?.current||null;}
+    get tracks() {const tracks=[this.current];for(const [index,layer] of this.layers)tracks[index]=layer.current;return tracks;}
+    clearTracks() {this.notifications.depth++;this.retire(this.current);this.current=null;for(const layer of this.layers.values())layer.clearTracks();this.layers.clear();this.notifications.depth--;this.drain();}
+    clearTrack(index) {if(index===0){this.notifications.depth++;this.retire(this.current);this.current=null;this.notifications.depth--;this.drain();}else{this.layers.get(index)?.clearTracks();this.layers.delete(index);}}
     addListener(listener) {this.listeners.push(listener);}
+    removeListener(listener) {const i=this.listeners.indexOf(listener);if(i>=0)this.listeners.splice(i,1);}
+    clearListeners() {this.listeners.length=0;}
+    clearListenerNotifications() {this.notifications.queue.length=0;}
     update(delta) {
+      if(!Number.isFinite(delta)||delta<0||this.timeScale<0)throw new FormatError('Invalid animation delta or time scale');
+      this.notifications.depth++;
       delta*=this.timeScale;
+      for(const layer of this.layers.values())layer.update(delta);
       const old=this.current;let transitioned=false;
       const advance=entry=>{
         if(!entry)return;
+        if(entry.timeScale<0)throw new FormatError('Negative track time scale; use reverse');
         entry.trackTime+=delta*entry.timeScale;
         if(entry.mixingFrom) {
-          if(entry.mixTime>=entry.mixDuration) {
-            if(entry===this.current){entry.mixingFrom=null;entry.rotationWinding.clear();}
+          if(entry.mixTime>=entry.mixDuration&&entry.lastTime!==-1) {
+            if(entry===this.current){this.retire(entry.mixingFrom);entry.mixingFrom=null;entry.rotationWinding.clear();}
           } else {entry.mixTime+=delta;if(!(transitioned&&entry===old))advance(entry.mixingFrom);}
         }
       };
+      if(old?.delay>0){const elapsed=delta*old.timeScale;old.delay-=elapsed;if(old.delay>0){this.notifications.depth--;this.drain();return;}delta=old.timeScale?-old.delay/old.timeScale:0;old.delay=0;}
       if(old?.next && old.lastTime>=old.next.delay) {
-        if(old.mixingFrom)old.interruptAlpha*=old.mixDuration>0 ? Math.min(1,old.mixTime/old.mixDuration) : 1;
         this.current=old.next;old.next=null;this.current.trackTime=old.trackTime-this.current.delay;
+        this.current.delay=0;
+        this.current.interruptAlpha=old.mixingFrom&&old.mixDuration>0?Math.min(1,old.mixTime/old.mixDuration):1;
         this.current.mixTime=0;this.current.mixingFrom=old;old.rotationWinding.clear();
+        old.mixingTo=this.current;this.current.previous=null;this.current.started=true;this.notify('interrupt',old);this.notify('start',this.current);
         transitioned=true;
       }
       advance(this.current);
+      this.notifications.depth--;this.drain();
     }
-    apply() {
+    apply({layer=false,lowerProperties=new Set()}={}) {
       const skeleton=this.skeleton;
-      if(!this.current){skeleton.setToSetupPose();return [];}
+      if(!this.current&&!this.layers.size)return [];
+      this.notifications.depth++;
       // Timelines restore their own setup properties. Preserve the preceding
       // pose/deform directly instead of copying it, resetting it, then copying
       // it back. Draw order is the only whole-pose setup value retained by that
       // former reset/restore sequence.
-      skeleton.drawOrder=skeleton.slots.map((_,i)=>i);
-      const animatedAttachments=new Set(this.current.animation.timelines.filter(t=>t.type==='attachment').map(t=>t.slot));
+      if(!layer)skeleton.drawOrder=skeleton.slots.map((_,i)=>i);
+      if(!this.current||this.current.delay>0){let events=[];for(const [,track] of [...this.layers].sort((a,b)=>a[0]-b[0]))events.push(...track.apply({layer:true,lowerProperties}));this.notifications.depth--;this.drain();return events;}
+      const animation=this.current.animation;
+      if(!this.attachments.has(animation))this.attachments.set(animation,new Set(animation.timelines.filter(t=>t.type==='attachment').map(t=>t.slot)));
+      const animatedAttachments=this.attachments.get(animation);
       const activeProperties=entry=>{
-        return new Set(entry.animation.timelines.flatMap(timelineProperties));
+        if(!this.properties.has(entry.animation))this.properties.set(entry.animation,new Set(entry.animation.timelines.flatMap(timelineProperties)));
+        return this.properties.get(entry.animation);
       };
       const apply=(entry,incoming=null)=>{
         const mix=entry.mixDuration>0 ? Math.min(1,entry.mixTime/entry.mixDuration) : 1;
-        if(entry.mixingFrom)apply(entry.mixingFrom,{properties:activeProperties(entry),mix});
-        const earlierProperties=new Set();
+        const outgoingEvents=entry.mixingFrom?apply(entry.mixingFrom,{properties:activeProperties(entry),mix,interruptAlpha:entry.interruptAlpha,holdPrevious:entry.holdPrevious}):[];
+        const earlierProperties=new Set(lowerProperties);
         for(let earlier=entry.mixingFrom;earlier;earlier=earlier.mixingFrom)for(const property of activeProperties(earlier))earlierProperties.add(property);
-        const animationTime=entry.loop?entry.trackTime:Math.min(entry.trackTime,entry.animation.duration);
-        const events=skeleton.applyAnimation(entry.animation.name,animationTime,{loop:entry.loop,lastTime:incoming?animationTime:entry.lastTime,
-          timelineAlpha:t=>incoming ? entry.interruptAlpha*(timelineProperties(t).every(k=>earlierProperties.has(k)) ? 1-incoming.mix : timelineProperties(t).some(k=>incoming.properties.has(k)) ? 1 : 1-incoming.mix) : entry.mixingFrom?mix:1,
-          discreteAlpha:incoming?0:1,mixOut:!!incoming,
-          timelineSetup:t=>!timelineProperties(t).every(k=>earlierProperties.has(k)),
+        const poseTime=Math.min(entry.animationTime,entry.animationEnd),animationTime=entry.reverse?entry.animationEnd-(poseTime-entry.animationStart):poseTime;
+        const expired=!incoming&&entry.trackTime>=entry.trackEnd&&!entry.next&&!entry.mixingFrom;
+        skeleton.applyAnimation(entry.animation,animationTime,{lastTime:entry.animationLast,resetTimelines:false,
+          timelineAlpha:t=>(expired?0:entry.alpha)*(incoming ? incoming.interruptAlpha*(incoming.holdPrevious?1:timelineProperties(t).every(k=>earlierProperties.has(k)) ? 1-incoming.mix : timelineProperties(t).some(k=>incoming.properties.has(k)) ? 1 : 1-incoming.mix) : entry.mixingFrom?mix:1),
+          discreteAlpha:t=>!incoming||t.type==='attachment'&&incoming.mix<entry.mixAttachmentThreshold||t.type==='drawOrder'&&incoming.mix<entry.mixDrawOrderThreshold?1:0,mixOut:!!incoming,
+          mixBlend:layer&&entry.mixBlend!=='replace'?entry.mixBlend:null,
+          timelineSetup:(t,property)=>entry.mixBlend!=='add'&&(property?!earlierProperties.has(property):!timelineProperties(t).every(k=>earlierProperties.has(k))),
+          discreteAllowed:t=>{
+            if(expired&&(t.type==='attachment'||t.type==='drawOrder')){if(t.type==='attachment'&&!earlierProperties.has(`slot/${t.slot}/attachment`))skeleton.setAttachment(t.slot,skeleton.slots[t.slot].data.attachment);if(t.type==='drawOrder'&&!earlierProperties.has('drawOrder'))skeleton.drawOrder=skeleton.slots.map((_,i)=>i);return false;}
+            if(!incoming)return t.type!=='attachment'||entry.alpha>entry.alphaAttachmentThreshold;
+            if(t.type==='attachment'&&incoming.mix>=entry.mixAttachmentThreshold){if(!earlierProperties.has(`slot/${t.slot}/attachment`))skeleton.setAttachment(t.slot,skeleton.slots[t.slot].data.attachment);return false;}
+            if(t.type==='drawOrder'&&incoming.mix>=entry.mixDrawOrderThreshold){if(!earlierProperties.has('drawOrder'))skeleton.drawOrder=skeleton.slots.map((_,i)=>i);return false;}
+            return true;
+          },
+          beforeFirst:t=>layer&&entry.mixBlend==='replace'&&timelineProperties(t).some(k=>earlierProperties.has(k))?'replace':'setup',
           rotationBase:t=>!earlierProperties.has(`bone/${t.bone}/rotation`) ? skeleton.bones[t.bone].data.rotation : null,
           rotationDifference:(timeline,raw,atEnd)=>{
             const wrap=value=>{value%=360;if(value>180)value-=360;if(value<-180)value+=360;return value;};
             let difference=wrap(raw);
+            if(entry.shortestRotation)return difference;
             const previous=entry.rotationWinding.get(timeline);
             if(difference===0 && previous!==undefined)return previous;
             if(difference===0){entry.rotationWinding.set(timeline,0);return 0;}
@@ -1200,13 +1298,34 @@ const SkelPlayer = (() => {
             }
             entry.rotationWinding.set(timeline,difference);return difference;
           }});
-        entry.lastTime=entry.trackTime;
-        if(!incoming)for(const event of events)for(const listener of this.listeners)listener.event?.(entry,event);
-        return events;
+        const events=this.entryEvents(entry,!incoming||incoming.mix<entry.eventThreshold);
+        entry.lastTime=entry.trackTime;entry.animationLast=animationTime;entry.sampledAnimationLast=animationTime;
+        return outgoingEvents.concat(events);
       };
       const events=apply(this.current);
-      skeleton.slots.forEach((slot,i)=>{if(!animatedAttachments.has(i))skeleton.setAttachment(i,slot.data.attachment);});
+      if(!layer)skeleton.slots.forEach((slot,i)=>{if(!animatedAttachments.has(i))skeleton.setAttachment(i,slot.data.attachment);});
+      for(const property of activeProperties(this.current))lowerProperties.add(property);
+      for(const [,track] of [...this.layers].sort((a,b)=>a[0]-b[0]))events.push(...track.apply({layer:true,lowerProperties}));
+      if(this.current.trackTime>=this.current.trackEnd&&!this.current.next&&!this.current.mixingFrom){this.retire(this.current);this.current=null;}
+      this.notifications.depth--;this.drain();
       return events;
+    }
+    entryEvents(entry,emitEvents) {
+      let previous=entry.lastTime;
+      const current=entry.trackTime,start=entry.animationStart,end=entry.animationEnd,duration=end-start,notifications=[];
+      if(entry.animationLast!==(entry.sampledAnimationLast??-1)){const cycle=entry.loop&&duration>0?Math.max(0,Math.floor(previous/duration)):0;previous=cycle*duration+entry.animationLast-start;}
+      if(!this.triggers.has(entry.animation))this.triggers.set(entry.animation,entry.animation.timelines.filter(t=>t.type==='event'||t.type==='physicsReset'));
+      if(!entry.reverse)for(const t of this.triggers.get(entry.animation))if(t.type==='physicsReset'||emitEvents)for(const frame of t.frames){
+        if(frame.time<start||frame.time>end)continue;
+        const offset=frame.time-start;
+        const first=entry.loop&&duration>0?Math.max(0,Math.floor((previous-offset)/duration)+1):0;
+        const last=entry.loop&&duration>0?Math.floor((current-offset)/duration):0;
+        for(let cycle=first;cycle<=last;cycle++){const at=offset+cycle*duration;if(at>previous&&at<=current){if(t.type==='physicsReset'){for(const [i,c] of this.skeleton.constraints.physics.entries())if(t.physics===i||t.physics===-1)c.resetPending=true;}else if(previous>=0||frame.time>entry.animationLast)notifications.push({at,type:'event',order:cycle>0&&offset===0?2:0,event:{...frame,absoluteTime:at}});}}
+      }
+      if(duration>0){const first=Math.max(1,Math.floor(previous/duration)+1),last=entry.loop?Math.floor(current/duration):Math.min(1,Math.floor(current/duration));for(let cycle=first;cycle<=last;cycle++)notifications.push({at:cycle*duration,type:'complete'});}
+      else if(previous<0)notifications.push({at:0,type:'complete'});
+      notifications.sort((a,b)=>a.at-b.at||(a.order??(a.type==='complete'?1:0))-(b.order??(b.type==='complete'?1:0)));
+      const events=[];for(const n of notifications){this.notify(n.type,entry,n.event);if(n.event)events.push(n.event);}return events;
     }
   }
   function attachmentUVs(slot) {
@@ -1217,8 +1336,17 @@ const SkelPlayer = (() => {
   }
   const cross=(a,b,c)=>(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
   function triangulatePolygon(points) {
+    if(points.some(p=>!Number.isFinite(p[0])||!Number.isFinite(p[1])))throw new FormatError('Non-finite clipping polygon');
+    // Exporters and deformation can leave a repeated closing vertex, adjacent
+    // duplicate vertices or a straight edge split into several points.
+    points=points.filter((p,i)=>i===0||Math.hypot(p[0]-points[i-1][0],p[1]-points[i-1][1])>1e-10);
+    if(points.length>1&&Math.hypot(points[0][0]-points.at(-1)[0],points[0][1]-points.at(-1)[1])<=1e-10)points.pop();
+    if(points.some(p=>!Number.isFinite(p[0])||!Number.isFinite(p[1])))throw new FormatError('Non-finite clipping polygon');
+    let changed=true;
+    while(changed&&points.length>2){changed=false;for(let i=0;i<points.length;i++){const a=points[(i+points.length-1)%points.length],b=points[i],c=points[(i+1)%points.length];if(Math.abs(cross(a,b,c))<=1e-10&&(b[0]-a[0])*(b[0]-c[0])+(b[1]-a[1])*(b[1]-c[1])<=0){points.splice(i,1);changed=true;break;}}}
     if(points.length<3)return [];
     let area=0;for(let i=0;i<points.length;i++){const p=points[i],q=points[(i+1)%points.length];area+=p[0]*q[1]-p[1]*q[0];}
+    if(Math.abs(area)<=1e-10)return [];
     const indices=points.map((_,i)=>i);if(area<0)indices.reverse();const triangles=[];
     while(indices.length>3) {
       let found=false;
@@ -1271,18 +1399,18 @@ const SkelPlayer = (() => {
     }
     return out;
   }
-  function drawCommands(skeleton) {
+  function drawCommands(skeleton,{vertexEffect=skeleton.vertexEffect}={}) {
     const commands=[];let clipping=null,endSlot=null;
     for(const index of skeleton.drawOrder) {
       if(index===null)throw new FormatError("Animation has an invalid draw order");
       const slot=skeleton.slots[index],a=slot.attachment;
-      if(!skeleton.bones[slot.data.bone].active)continue;
+      if(!skeleton.bones[slot.data.bone].active){if(clipping&&index===endSlot){clipping=null;endSlot=null;}continue;}
       if(a?.type==="clipping") {
         if(!clipping) {
           const vertices=skeleton.worldVertices(index),points=[];
           for(let i=0;i<vertices.length;i+=2)points.push(vertices.slice(i,i+2));
           clipping=convexPartitions(points);endSlot=a.end;
-        }
+        }else if(index===endSlot){clipping=null;endSlot=null;}
         // A start marker does not itself terminate clipping. A marker whose
         // end points to its own slot therefore clips the remaining draw order.
         continue;
@@ -1304,28 +1432,147 @@ const SkelPlayer = (() => {
       }
       if(clipping && index===endSlot){clipping=null;endSlot=null;}
     }
+    if(vertexEffect){
+      vertexEffect.begin?.(skeleton);
+      try{for(const command of commands)for(const vertex of command.vertices){
+        const position={x:vertex[0],y:vertex[1]},uv={x:vertex[2],y:vertex[3]},light={r:command.light[0],g:command.light[1],b:command.light[2],a:command.light[3]},dark={r:command.dark[0],g:command.dark[1],b:command.dark[2],a:0};
+        vertexEffect.transform(position,uv,light,dark);
+        vertex.splice(0,vertex.length,position.x,position.y,uv.x,uv.y,light.r,light.g,light.b,light.a,dark.r,dark.g,dark.b);
+      }}finally{vertexEffect.end?.();}
+    }
     return commands;
   }
   class Renderer {
     constructor(canvas,{mode="auto",viewport={x:-700,y:-100,width:1400,height:1400},background="26313bff",premultipliedAlpha=null}={}) {
+      this.disposed=false;
       this.canvas=canvas;this.viewport=viewport;this.background=unpackColor(background.replace(/^#/,""));this.premultipliedAlpha=premultipliedAlpha;this.images=new Map();this.textures=new Map();this.tintCache=new Map();
-      const contextOptions={alpha:true,premultipliedAlpha:true,antialias:true,preserveDrawingBuffer:true};
-      const gl=mode!=="canvas2d" ? canvas.getContext('webgl2',contextOptions)||canvas.getContext("webgl",contextOptions) : null;
-      if(!gl && mode==="webgl")throw new FormatError("WebGL unavailable");
-      this.gl=gl;this.mode=gl ? "webgl" : "canvas2d";
-      if(gl) {
-        this.webgl2=typeof WebGL2RenderingContext!=='undefined'&&gl instanceof WebGL2RenderingContext;
-        const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new FormatError(gl.getShaderInfoLog(s));return s;};
-        const vertex=shader(gl.VERTEX_SHADER,(this.webgl2?'#version 300 es\nin vec2 position; in vec2 texcoord; in vec4 lightColor; in vec3 darkColor; out vec2 uv; out vec4 light; out vec3 dark;':'attribute vec2 position; attribute vec2 texcoord; attribute vec4 lightColor; attribute vec3 darkColor; varying vec2 uv; varying vec4 light; varying vec3 dark;')+" uniform mat4 projection; void main(){gl_Position=projection*vec4(position,0.0,1.0);uv=texcoord;light=lightColor;dark=darkColor;}");
-        const fragment=shader(gl.FRAGMENT_SHADER,(this.webgl2?'#version 300 es\nprecision highp float; in vec2 uv; in vec4 light; in vec3 dark; out vec4 outColor;':'precision highp float; varying vec2 uv; varying vec4 light; varying vec3 dark;')+" uniform sampler2D image; uniform float pma; void main(){vec4 t="+(this.webgl2?'texture':'texture2D')+"(image,uv);vec3 rgb=t.rgb*light.rgb+(vec3(mix(1.0,t.a,pma))-t.rgb)*dark;"+(this.webgl2?'outColor':'gl_FragColor')+"=vec4(rgb*mix(1.0,light.a,pma),t.a*light.a);}");
-        this.program=gl.createProgram();gl.attachShader(this.program,vertex);gl.attachShader(this.program,fragment);gl.linkProgram(this.program);
-        gl.deleteShader(vertex);gl.deleteShader(fragment);
-        if(!gl.getProgramParameter(this.program,gl.LINK_STATUS))throw new FormatError(gl.getProgramInfoLog(this.program));
-        this.buffer=gl.createBuffer();this.locations={};
-        for(const name of ["projection","image","pma"])this.locations[name]=gl.getUniformLocation(this.program,name);
-        for(const name of ["position","texcoord","lightColor","darkColor"])this.locations[name]=gl.getAttribLocation(this.program,name);
-      } else this.context=canvas.getContext("2d");
-      if(!gl && !this.context)throw new FormatError("No canvas renderer available");
+      this.gl=null;this.gpu=null;this.context=null;this.webgl2=false;this.program=null;this.buffer=null;this.locations={};this.recovering=null;this.backendError=null;
+      let requested=mode;
+      if(mode==="auto"){
+        const forced=globalThis.__STS2_FORCE_RENDER_BACKEND;
+        if(["webgpu","webgl2","webgl1","canvas2d"].includes(forced))requested=forced;
+        else try{const value=new URLSearchParams(globalThis.location?.search||"").get("gpu_backend");if(["webgpu","webgl2","webgl1","canvas2d"].includes(value))requested=value;}catch{}
+      }
+      this.requestedMode=requested;
+      if(requested==="canvas2d"){this._initCanvas();this.readyPromise=Promise.resolve(this);}
+      else if(["webgl","webgl2","webgl1"].includes(requested)){
+        if(!this._initGL(requested))throw new FormatError(requested==="webgl1"?"WebGL1 unavailable":"WebGL unavailable");
+        this.readyPromise=Promise.resolve(this);
+      }else{
+        this.mode="initializing";
+        this.readyPromise=this._initPreferred(requested);
+      }
+    }
+    ready(){return this.readyPromise||Promise.resolve(this);}
+    _markBackend(){
+      if(this.canvas?.dataset){this.canvas.dataset.backend=this.mode;this.canvas.dataset.requestedBackend=this.requestedMode;}
+    }
+    _replaceCanvas(){
+      const old=this.canvas;
+      if(typeof document==="undefined"||!old?.cloneNode)return old;
+      const next=old.cloneNode(false);next.width=old.width;next.height=old.height;
+      if(old.parentNode)old.replaceWith(next);
+      this.canvas=next;return next;
+    }
+    _initCanvas(){
+      this.gl=null;this.gpu=null;this.webgl2=false;
+      this.context=this.canvas.getContext("2d");
+      if(!this.context)throw new FormatError("Canvas2D unavailable");
+      this.mode="canvas2d";this._markBackend();return true;
+    }
+    _initGL(requested="webgl"){
+      const options={alpha:true,premultipliedAlpha:true,antialias:true,preserveDrawingBuffer:true};
+      const gl=requested==="webgl1"?this.canvas.getContext("webgl",options):requested==="webgl2"?this.canvas.getContext("webgl2",options):(this.canvas.getContext("webgl2",options)||this.canvas.getContext("webgl",options));
+      if(!gl)return false;
+      this.context=null;this.gpu=null;this.gl=gl;
+      this.webgl2=typeof WebGL2RenderingContext!=="undefined"&&gl instanceof WebGL2RenderingContext;
+      this.mode=this.webgl2?"webgl2":"webgl1";
+      const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new FormatError(gl.getShaderInfoLog(s));return s;};
+      const vertex=shader(gl.VERTEX_SHADER,(this.webgl2?'#version 300 es\nin vec2 position; in vec2 texcoord; in vec4 lightColor; in vec3 darkColor; out vec2 uv; out vec4 light; out vec3 dark;':'attribute vec2 position; attribute vec2 texcoord; attribute vec4 lightColor; attribute vec3 darkColor; varying vec2 uv; varying vec4 light; varying vec3 dark;')+" uniform mat4 projection; void main(){gl_Position=projection*vec4(position,0.0,1.0);uv=texcoord;light=lightColor;dark=darkColor;}");
+      const fragment=shader(gl.FRAGMENT_SHADER,(this.webgl2?'#version 300 es\nprecision highp float; in vec2 uv; in vec4 light; in vec3 dark; out vec4 outColor;':'precision highp float; varying vec2 uv; varying vec4 light; varying vec3 dark;')+" uniform sampler2D image; uniform float pma; void main(){vec4 t="+(this.webgl2?'texture':'texture2D')+"(image,uv);vec3 rgb=t.rgb*light.rgb+(vec3(mix(1.0,t.a,pma))-t.rgb)*dark;"+(this.webgl2?'outColor':'gl_FragColor')+"=vec4(rgb*mix(1.0,light.a,pma),t.a*light.a);}");
+      this.program=gl.createProgram();gl.attachShader(this.program,vertex);gl.attachShader(this.program,fragment);gl.linkProgram(this.program);
+      gl.deleteShader(vertex);gl.deleteShader(fragment);
+      if(!gl.getProgramParameter(this.program,gl.LINK_STATUS))throw new FormatError(gl.getProgramInfoLog(this.program));
+      this.buffer=gl.createBuffer();this.locations={};
+      for(const name of ["projection","image","pma"])this.locations[name]=gl.getUniformLocation(this.program,name);
+      for(const name of ["position","texcoord","lightColor","darkColor"])this.locations[name]=gl.getAttribLocation(this.program,name);
+      const lostMode=this.mode;
+      this.canvas.addEventListener?.("webglcontextlost",event=>{event.preventDefault?.();void this._recover(lostMode,new Error(lostMode+" context lost"));},{once:true});
+      this._markBackend();
+      return true;
+    }
+    async _initPreferred(requested){
+      const forced=requested==="webgpu";
+      if(globalThis.navigator?.gpu){
+        try{
+          const module=await import("./skelgpu.js");
+          this.gpu=await module.createSkeletonWebGPU(this.canvas,{background:this.background,onDeviceLost:error=>void this._recover("webgpu",error)});
+          if(this.disposed){this.gpu.dispose();this.gpu=null;return this;}
+          this.mode="webgpu";this._markBackend();return this;
+        }catch(error){
+          this.backendError=error;
+          if(forced)throw error;
+          this._replaceCanvas();
+        }
+      }else if(forced)throw new FormatError("WebGPU unavailable");
+      if(this.disposed)return this;
+      if(this._initGL("webgl2"))return this;
+      this._replaceCanvas();
+      if(this._initGL("webgl1"))return this;
+      this._replaceCanvas();this._initCanvas();return this;
+    }
+    _disposeGL({lose=false}={}){
+      if(!this.gl)return;
+      const gl=this.gl;
+      for(const t of this.textures.values())try{gl.deleteTexture(t);}catch{}
+      this.textures.clear();
+      if(this.buffer)try{gl.deleteBuffer(this.buffer);}catch{}
+      if(this.program)try{gl.deleteProgram(this.program);}catch{}
+      if(lose)try{gl.getExtension("WEBGL_lose_context")?.loseContext();}catch{}
+      this.gl=null;this.buffer=null;this.program=null;this.locations={};
+    }
+    async _recover(lostMode,error){
+      if(this.disposed)return;
+      if(this.recovering)return this.recovering;
+      const chain={webgpu:["webgl2","webgl1","canvas2d"],webgl2:["webgl1","canvas2d"],webgl1:["canvas2d"]}[lostMode]||[];
+      this.backendError=error;this.mode="recovering";
+      this.recovering=(async()=>{
+        try{this.gpu?.dispose();}catch{}this.gpu=null;
+        this._disposeGL();
+        for(const backend of chain){
+          if(this.disposed)return;
+          this._replaceCanvas();
+          try{
+            if(backend==="canvas2d")this._initCanvas();
+            else if(!this._initGL(backend))continue;
+            await this._uploadCurrentTextures();
+            if(this.disposed){this._disposeGL({lose:true});return;}
+            this.backendError=null;
+            return this;
+          }catch(nextError){this.backendError=nextError;this._disposeGL();}
+        }
+        this.mode="unavailable";throw this.backendError||new FormatError("No canvas renderer available");
+      })().catch(error=>{console.warn?.("[skelplayer] renderer fallback failed",error);return this;}).finally(()=>{this.recovering=null;});
+      return this.recovering;
+    }
+    _uploadGLTexture(page,img){
+      const gl=this.gl;if(!gl)return;
+      const old=this.textures.get(page);if(old)gl.deleteTexture(old);
+      const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,false);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+      const powerOfTwo=n=>(n&(n-1))===0,mipmaps=this.webgl2||powerOfTwo(img.naturalWidth)&&powerOfTwo(img.naturalHeight);
+      if(mipmaps)gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,mipmaps?gl.LINEAR_MIPMAP_LINEAR:gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+      const anisotropy=gl.getExtension("EXT_texture_filter_anisotropic");
+      if(anisotropy)gl.texParameterf(gl.TEXTURE_2D,anisotropy.TEXTURE_MAX_ANISOTROPY_EXT,Math.min(8,gl.getParameter(anisotropy.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);this.textures.set(page,t);
+    }
+    async _uploadCurrentTextures(){
+      for(const [page,img] of this.images){
+        if(this.gpu)await this.gpu.loadTexture(page,img);
+        else if(this.gl)this._uploadGLTexture(page,img);
+      }
     }
     async loadTextures(atlas,atlasUrl,{signal=null}={}) {
       for(const page of atlas.pages) {
@@ -1341,19 +1588,8 @@ const SkelPlayer = (() => {
         // Atlas coordinates use the declared logical page size. Exported images
         // may include padding; their physical dimensions only fill missing size.
         page.width ||= img.naturalWidth;page.height ||= img.naturalHeight;this.images.set(page,img);
-        if(this.gl) {
-          const gl=this.gl,t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,false);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
-          gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
-          const powerOfTwo=n=>(n&(n-1))===0,mipmaps=this.webgl2||powerOfTwo(img.naturalWidth)&&powerOfTwo(img.naturalHeight);
-          if(mipmaps)gl.generateMipmap(gl.TEXTURE_2D);
-          // The site's reference renderer uses trilinear minification, including
-          // atlas pages whose optional filter metadata says Linear,Linear.
-          gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,mipmaps?gl.LINEAR_MIPMAP_LINEAR:gl.LINEAR);
-          gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
-          const anisotropy=gl.getExtension('EXT_texture_filter_anisotropic');
-          if(anisotropy)gl.texParameterf(gl.TEXTURE_2D,anisotropy.TEXTURE_MAX_ANISOTROPY_EXT,Math.min(8,gl.getParameter(anisotropy.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
-          gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);this.textures.set(page,t);
-        }
+        if(this.gpu)await this.gpu.loadTexture(page,img);
+        else if(this.gl)this._uploadGLTexture(page,img);
       }
     }
     resize(width,height) {this.canvas.width=Math.max(1,Math.round(width));this.canvas.height=Math.max(1,Math.round(height));}
@@ -1361,10 +1597,16 @@ const SkelPlayer = (() => {
       return this.renderMany([skeleton]);
     }
     renderMany(skeletons) {
-      const commands=skeletons.flatMap(drawCommands),{canvas,viewport:v}=this;
-      if(this.gl) {
+      const commands=skeletons.flatMap(skeleton=>drawCommands(skeleton,{vertexEffect:this.vertexEffect??skeleton.vertexEffect})),{canvas,viewport:v}=this;
+      if(this.gpu) {
+        this.gpu.render(commands,v,canvas.width,canvas.height,this.premultipliedAlpha);
+      } else if(this.gl) {
         const gl=this.gl;gl.viewport(0,0,canvas.width,canvas.height);gl.clearColor(...this.background);gl.clear(gl.COLOR_BUFFER_BIT);gl.enable(gl.BLEND);gl.disable(gl.DEPTH_TEST);gl.disable(gl.CULL_FACE);
-        gl.useProgram(this.program);gl.uniformMatrix4fv(this.locations.projection,false,new Float32Array([2/v.width,0,0,0,0,2/v.height,0,0,0,0,-.02,0,-1-2*v.x/v.width,-1-2*v.y/v.height,-1,1]));gl.uniform1i(this.locations.image,0);gl.activeTexture(gl.TEXTURE0);gl.bindBuffer(gl.ARRAY_BUFFER,this.buffer);
+        // Float32 projection followed by camera translation, as with separate
+        // orthographic and view matrices. Rounding only the final expression
+        // shifts a few raster edges at large viewports.
+        const sx=Math.fround(2/v.width),sy=Math.fround(2/v.height);
+        gl.useProgram(this.program);gl.uniformMatrix4fv(this.locations.projection,false,new Float32Array([sx,0,0,0,0,sy,0,0,0,0,-.02,0,-sx*(v.x+v.width/2),-sy*(v.y+v.height/2),-1,1]));gl.uniform1i(this.locations.image,0);gl.activeTexture(gl.TEXTURE0);gl.bindBuffer(gl.ARRAY_BUFFER,this.buffer);
         for(const [name,size,offset] of [["position",2,0],["texcoord",2,8],["lightColor",4,16],["darkColor",3,32]]){gl.enableVertexAttribArray(this.locations[name]);gl.vertexAttribPointer(this.locations[name],size,gl.FLOAT,false,44,offset);}
         let batch=null;
         const required=commands.reduce((n,c)=>n+c.vertices.length*11,0);
@@ -1376,8 +1618,8 @@ const SkelPlayer = (() => {
           if(!batch||batch.page!==c.page||batch.mode!==c.blend||batch.pma!==pma){flush();used=0;batch={page:c.page,mode:c.blend,pma,blend,additive:c.blend==="additive"};}
           for(const vertex of c.vertices){
             this.vertexData[used++]=vertex[0];this.vertexData[used++]=vertex[1];this.vertexData[used++]=vertex[2];this.vertexData[used++]=vertex[3];
-            this.vertexData[used++]=c.light[0];this.vertexData[used++]=c.light[1];this.vertexData[used++]=c.light[2];this.vertexData[used++]=c.light[3];
-            this.vertexData[used++]=c.dark[0];this.vertexData[used++]=c.dark[1];this.vertexData[used++]=c.dark[2];
+            this.vertexData[used++]=vertex[4]??c.light[0];this.vertexData[used++]=vertex[5]??c.light[1];this.vertexData[used++]=vertex[6]??c.light[2];this.vertexData[used++]=vertex[7]??c.light[3];
+            this.vertexData[used++]=vertex[8]??c.dark[0];this.vertexData[used++]=vertex[9]??c.dark[1];this.vertexData[used++]=vertex[10]??c.dark[2];
           }
         }
         flush();
@@ -1413,16 +1655,26 @@ const SkelPlayer = (() => {
       }
     }
     readPixels() {
+      if(this.gpu)throw new FormatError("WebGPU readback is asynchronous; use readPixelsAsync()");
       if(!this.gl)return this.context.getImageData(0,0,this.canvas.width,this.canvas.height).data;
       const pixels=new Uint8Array(this.canvas.width*this.canvas.height*4);this.gl.readPixels(0,0,this.canvas.width,this.canvas.height,this.gl.RGBA,this.gl.UNSIGNED_BYTE,pixels);return pixels;
     }
+    async readPixelsAsync() {
+      if(this.gpu)return this.gpu.readPixels(this.canvas.width,this.canvas.height);
+      return this.readPixels();
+    }
     dispose() {
-      if(this.gl){for(const t of this.textures.values())this.gl.deleteTexture(t);this.gl.deleteBuffer(this.buffer);this.gl.deleteProgram(this.program);this.gl.getExtension("WEBGL_lose_context")?.loseContext();}
+      if(this.disposed)return;this.disposed=true;
+      try{this.gpu?.dispose();}catch{}this.gpu=null;
+      this._disposeGL({lose:true});
       this.images.clear();this.textures.clear();this.tintCache.clear();this.vertexData=null;
     }
   }
+  // Opt-in bounds reuse across players. Content digests avoid stale URL-based
+  // reuse after asset replacement; namespaces describe caller-side data edits.
+  const animationBoundsCache=new Map(),animationBoundsCacheLimit=256;
   class Player {
-    constructor(target,{mode='auto',viewport=null,background='00000000',premultipliedAlpha=false,defaultMix=.25,autoPlay=true,onError=null,onEvent=null,compatibilityProbe=null,onCompatibility=null}={}) {
+    constructor(target,{mode='auto',viewport=null,background='00000000',premultipliedAlpha=false,defaultMix=.25,autoPlay=true,onError=null,onEvent=null,compatibilityProbe=null,onCompatibility=null,cacheBounds=false}={}) {
       this.target=typeof target==='string' ? document.getElementById(target) : target;
       if(!this.target)throw new FormatError('Player target is missing');
       this.ownsCanvas=this.target.tagName!=='CANVAS';
@@ -1431,7 +1683,7 @@ const SkelPlayer = (() => {
       if(this.ownsCanvas){this.canvas.style.width='100%';this.canvas.style.height='100%';this.canvas.style.display='block';this.target.appendChild(this.canvas);}
       try {this.renderer=new Renderer(this.canvas,{mode,viewport:viewport||{x:0,y:0,width:1,height:1},background,premultipliedAlpha});}
       catch(error){if(this.ownsCanvas)this.canvas.remove();throw error;}
-      this.options={defaultMix,autoPlay,onError,onEvent,compatibilityProbe,onCompatibility};this.disposed=false;this.running=false;this.frame=null;this.lastFrame=null;
+      this.options={defaultMix,autoPlay,onError,onEvent,compatibilityProbe,onCompatibility,cacheBounds};this.disposed=false;this.running=false;this.frame=null;this.lastFrame=null;
       this.abort=new AbortController();this.viewport=viewport;
     }
     static async load(target,options) {
@@ -1441,6 +1693,9 @@ const SkelPlayer = (() => {
     }
     async load(skeletonUrl,atlasUrl) {
       if(this.disposed)throw new FormatError('Player is disposed');
+      await this.renderer.ready();
+      this.canvas=this.renderer.canvas;
+      if(this.disposed)throw new DOMException('Player loading cancelled','AbortError');
       const url=new URL(atlasUrl,document.baseURI).href,signal=this.abort.signal;
       const fetchData=async (path,binary)=>{
         const response=await fetch(path,{signal});if(!response.ok)throw new FormatError(`Asset request failed: ${response.status}`);
@@ -1448,6 +1703,9 @@ const SkelPlayer = (() => {
       };
       const [binary,text]=await Promise.all([fetchData(skeletonUrl,true),fetchData(url,false)]);
       if(this.disposed)throw new DOMException('Player loading cancelled','AbortError');
+      const fingerprint=this.options.cacheBounds&&globalThis.crypto?.subtle ? Promise.all([
+        crypto.subtle.digest('SHA-256',binary),crypto.subtle.digest('SHA-256',new TextEncoder().encode(text))
+      ]).then(values=>values.map(value=>Array.from(new Uint8Array(value),n=>n.toString(16).padStart(2,'0')).join('')).join(':')).catch(()=>null) : Promise.resolve(null);
       if(this.options.compatibilityProbe){
         this.compatibility=this.options.compatibilityProbe({skeleton:binary,atlas:text,format:/\.json(?:[?#]|$)/i.test(skeletonUrl)?'json':'binary',renderer:this.renderer.mode});
         this.options.onCompatibility?.(this.compatibility);
@@ -1457,6 +1715,7 @@ const SkelPlayer = (() => {
       this.animationState=new AnimationState(this.skeleton,{defaultMix:this.options.defaultMix});
       if(this.options.onEvent)this.animationState.addListener({event:(entry,event)=>this.options.onEvent(event,entry)});
       await this.renderer.loadTextures(this.atlas,url,{signal});
+      this._boundsFingerprint=await fingerprint;
       if(this.disposed)throw new DOMException('Player loading cancelled','AbortError');
       this.skeleton.updateWorld({constraints:true});
       if(!this.viewport) {
@@ -1472,7 +1731,9 @@ const SkelPlayer = (() => {
       if(![viewport.x,viewport.y,viewport.width,viewport.height].every(Number.isFinite)||viewport.width<=0||viewport.height<=0)throw new FormatError('Invalid viewport');
       this.viewport={...viewport};this.renderer.viewport=this.viewport;
     }
-    resize(width=this.canvas.clientWidth||this.target.clientWidth||1,height=this.canvas.clientHeight||this.target.clientHeight||1,pixelRatio=globalThis.devicePixelRatio||1) {
+    resize(width=null,height=null,pixelRatio=globalThis.devicePixelRatio||1) {
+      this.canvas=this.renderer.canvas;
+      width=width||this.canvas.clientWidth||this.target.clientWidth||1;height=height||this.canvas.clientHeight||this.target.clientHeight||1;
       this.renderer.resize(width*pixelRatio,height*pixelRatio);if(this.skeleton)this.draw();
     }
     step(delta) {
@@ -1504,24 +1765,37 @@ const SkelPlayer = (() => {
       }
       return Number.isFinite(x)&&right>x&&top>y ? {x,y,width:right-x,height:top-y} : {x:0,y:0,width:1,height:1};
     }
-    animationBounds(name,{step=1/30}={}) {
+    animationBounds(name,{step=1/30,cacheNamespace=null}={}) {
       const animation=this.data.animations.find(a=>a.name===name);if(!animation)throw new FormatError(`Unknown animation: ${name}`);
       if(!(step>0)||!Number.isFinite(step))throw new FormatError('Invalid sampling step');
-      const s=new Skeleton(this.data);s.setSkin(this.skeleton.skin.name);s.bindAtlas(this.atlas);s.scaleX=this.skeleton.scaleX;s.scaleY=this.skeleton.scaleY;
+      const key=this._boundsFingerprint&&cacheNamespace ? JSON.stringify([this._boundsFingerprint,cacheNamespace,name,
+        this.skeleton.skin.name,this.skeleton.scaleX,this.skeleton.scaleY,step,this.animationTracks||[],this.atlas.pages.map(page=>[page.width,page.height])]) : null;
+      if(key&&animationBoundsCache.has(key)){
+        const value=animationBoundsCache.get(key);animationBoundsCache.delete(key);animationBoundsCache.set(key,value);
+        this.boundsCacheHits=(this.boundsCacheHits||0)+1;return {...value};
+      }
+      const s=new Skeleton(this.data);s.setSkin(this.skeleton.skin.name);s.setSlotsToSetupPose();s.bindAtlas(this.atlas);s.scaleX=this.skeleton.scaleX;s.scaleY=this.skeleton.scaleY;
+      let state=null;
+      if(this.animationTracks?.length){
+        state=new AnimationState(s,{defaultMix:this.animationState.defaultMix,mixes:this.animationState.mixes});state.setAnimation(0,name,false);
+        for(const track of this.animationTracks){state.setAnimation(track.index,track.animation,track.loop);if(track.next)state.addAnimation(track.index,track.next,track.nextLoop,0);}
+      }
       let combined=null,previous=0;
       for(let i=0,count=Math.ceil(animation.duration/step);i<=count;i++) {
-        const time=Math.min(i*step,animation.duration);s.update(time-previous);previous=time;
-        s.setToSetupPose();s.applyAnimation(name,time);s.updateWorld({constraints:true,physics:i?'update':'reset'});
+        const time=Math.min(i*step,animation.duration),delta=time-previous;s.update(delta);previous=time;
+        if(state){state.update(delta);state.apply();}else{s.setToSetupPose();s.applyAnimation(name,time);}
+        s.updateWorld({constraints:true,physics:i?'update':'reset'});
         const b=this.bounds(s);
         if(!combined)combined=b;else {
           const right=Math.max(combined.x+combined.width,b.x+b.width),top=Math.max(combined.y+combined.height,b.y+b.height);
           combined.x=Math.min(combined.x,b.x);combined.y=Math.min(combined.y,b.y);combined.width=right-combined.x;combined.height=top-combined.y;
         }
       }
+      if(key){animationBoundsCache.set(key,Object.freeze({...combined}));if(animationBoundsCache.size>animationBoundsCacheLimit)animationBoundsCache.delete(animationBoundsCache.keys().next().value);}
       return combined;
     }
     dispose() {
-      if(this.disposed)return;this.disposed=true;this.abort.abort();this.stop();this.renderer.dispose();if(this.ownsCanvas)this.canvas.remove();
+      if(this.disposed)return;this.disposed=true;this.abort.abort();this.stop();this.renderer.dispose();if(this.ownsCanvas)this.renderer.canvas.remove();
     }
   }
   return { FormatError, Reader, parseAtlas, parseBinarySetup,parseBinary,

@@ -64,3 +64,29 @@ Additional documentation entries from the private dated record (accessed 2026-10
 - https://github.com/microsoft/playwright/blob/main/packages/playwright-core/src/server/chromium/crPage.ts
 
 Final publication gate (2026-10-10): the source-matched black-box matrix passes 1,810/1,810 eligible canonical cases over 853,822 compared frames, with zero pending cases. The official player was used only through its public API and rendered output; its runtime source or bundle was never read or searched. Exactly three malformed original exports that the official player also cannot play are excluded as broken inputs. Game comparison screenshots and all local parity receipts remain private and are not part of this repository. No runtime implementation code was consulted.
+
+## 2026-10-19 revision
+
+The AnimationState, physics mode, sequence, clipping and WebGPU additions were written from the public Spine 4.2 runtime documentation listed below, from general graphics mathematics and from the W3C WebGPU/WGSL specifications. As before, no official or derived runtime source, bundle, shader source or decompiled code was read, searched, copied or incorporated. The documentation describes concepts and API behaviour; the implementation and all test fixtures are original.
+
+Documentation consulted (accessed 2026-10-19):
+
+- https://esotericsoftware.com/spine-api-reference-4.2
+- https://esotericsoftware.com/spine-applying-animations
+- https://esotericsoftware.com/spine-unity-events
+- https://esotericsoftware.com/spine-constraints
+- https://esotericsoftware.com/spine-ik-constraints
+- https://esotericsoftware.com/spine-transform-constraints
+- https://esotericsoftware.com/spine-path-constraints
+- https://esotericsoftware.com/spine-physics-constraints
+- https://esotericsoftware.com/spine-clipping
+- https://esotericsoftware.com/spine-regions
+- https://esotericsoftware.com/spine-skins
+- https://esotericsoftware.com/spine-binary-format
+- https://esotericsoftware.com/spine-json-format
+- https://esotericsoftware.com/spine-changelog
+- https://esotericsoftware.com/spine-unity-rendering
+- https://www.w3.org/TR/webgpu/
+- https://www.w3.org/TR/WGSL/
+
+Generated game metadata (per-skeleton mix tables) and the site adapter are kept out of this repository.
