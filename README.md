@@ -33,4 +33,4 @@ Unknown or newer binary layouts, unknown attachment types and corrupt sequence m
 - The 2026-10-10 source-matched black-box matrix passed 1,810/1,810 eligible canonical cases across 853,822 compared frames. It covered 177 served skeleton paths of the exact Spine 4.2 export family (4.2.03–4.2.43) observed in the shipping game and its mods. The 2026-10-19 AnimationState, physics, sequence and clipping additions are covered by the synthetic tests above.
 - The published repository contains no game assets, extracted data, generated game metadata, screenshots, third-party runtime files, parity receipts or site history.
 
-Copyright (c) 2026 moooohung. All rights reserved. No permission to use, copy, modify or redistribute is granted except by prior written permission. Source visibility grants no license. See [LICENSE](LICENSE).
+Copyright (c) 2026 moooohung. Licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE). This license covers the first-party player code, tests and documentation only; it grants no rights to third-party software or game assets.
